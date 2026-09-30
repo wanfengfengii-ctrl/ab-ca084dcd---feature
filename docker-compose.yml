@@ -1,0 +1,27 @@
+services:
+  api:
+    build: .
+    image: fibre-arm-adjudicator:latest
+    environment:
+      APP_PORT: "8000"
+    ports:
+      # Host-side port is configurable via HOST_PORT (defaults to 8080).
+      - "${HOST_PORT:-8080}:8000"
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    image: fibre-arm-adjudicator:latest
+    build: .
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: "http://api:8000"
+    entrypoint: ["bash", "scripts/verify.sh"]
+    restart: "no"
