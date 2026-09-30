@@ -29,11 +29,17 @@ class TargetIn(StrictModel):
     priority: int = Field(..., ge=1)
 
 
+class TakeoverOptions(StrictModel):
+    # Opt-in: when omitted or false the request behaves exactly as before.
+    enabled: bool = False
+
+
 class AdjudicateRequest(StrictModel):
     arms: List[ArmIn] = Field(..., min_length=6, max_length=12)
     targets: List[TargetIn] = Field(..., min_length=6, max_length=16)
     clearance: int = Field(..., ge=1)
     minimum_allocations: int = Field(..., ge=1)
+    takeover: Optional[TakeoverOptions] = None
 
     @model_validator(mode="after")
     def _unique_ids(self) -> "AdjudicateRequest":
@@ -85,6 +91,49 @@ class ShortfallWitness(BaseModel):
     reachable_arm_target_links: int
 
 
+class ReassignmentOut(BaseModel):
+    arm_id: str
+    lost_target_id: str
+    spare_target_id: str
+    extension: float
+    extension_sq: int
+    priority: int
+
+
+class FixedPairingOut(BaseModel):
+    arm_id: str
+    target_id: str
+    extension_sq: int
+
+
+class BlockedStandbyOut(BaseModel):
+    arm_id: str
+    spare_target_id: str
+    extension_sq: int
+    priority: int
+    blocked_by_arm: str
+    blocked_by_target: str
+    clearance: dict
+
+
+class TakeoverScenarioOut(BaseModel):
+    arm_id: str
+    lost_target_id: str
+    reassignment: Optional[ReassignmentOut] = None
+    fixed_pairings: List[FixedPairingOut]
+    clearance_evidence: List[PairClearance]
+    blocked_candidates: Optional[List[BlockedStandbyOut]] = None
+
+
+class TakeoverReport(BaseModel):
+    enabled: bool
+    fully_certified: bool
+    num_scenarios: int
+    scenarios: List[TakeoverScenarioOut]
+    first_blocking_scenario: Optional[TakeoverScenarioOut] = None
+    max_certified_allocations: Optional[int] = None
+
+
 class AdjudicateResponse(BaseModel):
     status: str  # "ok" | "minimum_not_met"
     feasible: bool
@@ -97,3 +146,4 @@ class AdjudicateResponse(BaseModel):
     clearance: dict
     limits: dict
     witness: Optional[ShortfallWitness] = None
+    takeover: Optional[TakeoverReport] = None

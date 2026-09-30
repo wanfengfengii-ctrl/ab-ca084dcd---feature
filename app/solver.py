@@ -18,6 +18,19 @@ Hard constraints:
 * the closed segment of every pair of allocations keeps at least ``clearance``
   distance from every other allocation segment.
 
+Optional single-target-loss takeover certification
+---------------------------------------------------
+When ``require_takeover`` is enabled, the selected main plan must additionally
+be *certifiable*: for every allocated edge ``(i, j)`` there exists a spare
+target ``j'`` (reachable from arm ``i``, unused by the main plan) such that
+reconnecting only arm ``i`` from the lost target ``j`` to ``j'`` keeps every
+closed-segment clearance against the unchanged pairings.  The same spare may
+back several different loss scenarios; it only has to stay free within one
+scenario.  Certification is part of the branch-and-bound search (a relaxed
+optimum that is conflict-free but not certifiable is branched further), so the
+lexicographic order is optimised *among certifiable plans* in one pass rather
+than patching an unconstrained optimum afterwards.
+
 Algorithm
 ---------
 The whole lexicographic objective is encoded as one *integer* edge weight
@@ -73,6 +86,7 @@ class SolveResult:
     feasible: bool
     reason: Optional[str] = None
     witness: Optional[dict] = None
+    takeover: Optional[dict] = None
 
 
 INF = 10**100
@@ -85,11 +99,13 @@ class Solver:
         targets: Sequence[Target],
         clearance: int,
         minimum_allocations: int,
+        require_takeover: bool = False,
     ) -> None:
         self.arms = list(arms)
         self.targets = list(targets)
         self.clearance = clearance
         self.minimum_allocations = minimum_allocations
+        self.require_takeover = require_takeover
         self.n_arms = len(self.arms)
         self.n_targets = len(self.targets)
         self.clearance_sq = Fraction(clearance * clearance)
@@ -109,6 +125,9 @@ class Solver:
 
         self._pair_cache: Dict[Tuple[int, int, int, int],
                                Tuple[bool, Fraction, dict]] = {}
+        # spare_compat[(i,j')][(k,h)] == True when the standby edge (i->j')
+        # respects the clearance against the fixed allocation (k->h).
+        self._compat_cache: Dict[Tuple[Edge, Edge], bool] = {}
         self._make_weights()
 
     # ------------------------------------------------------------------
@@ -188,6 +207,145 @@ class Solver:
                     return used_edges[idx], used_edges[jdx]
         return None
 
+    # ------------------------------------------------------------------
+    # Single-target-loss takeover certification
+    # ------------------------------------------------------------------
+    def _spare_ok(self, standby: Edge, fixed: Edge) -> bool:
+        """Whether the standby segment ``standby`` (arm i -> unused target j')
+        keeps the required clearance against the fixed segment ``fixed``."""
+        key = (standby, fixed)
+        ok = self._compat_cache.get(key)
+        if ok is None:
+            (i, jp), (k, h) = standby, fixed
+            a, b = (i, k) if i < k else (k, i)
+            t1, t2 = (jp, h) if i < k else (h, jp)
+            ok = not self.pair_info(a, t1, b, t2)[0]
+            self._compat_cache[key] = ok
+        return ok
+
+    def _spare_witness(self, standby: Edge, fixed: Edge) -> dict:
+        """Full clearance evidence record for a standby/fixed segment pair."""
+        (i, jp), (k, h) = standby, fixed
+        a, b = (i, k) if i < k else (k, i)
+        t1, t2 = (jp, h) if i < k else (h, jp)
+        conflict, dist_sq, w = self.pair_info(a, t1, b, t2)
+        dist = dist_sq ** Fraction(1, 2)
+        return {
+            "arm_a": self.arms[a].id,
+            "target_a": self.targets[t1].id,
+            "arm_b": self.arms[b].id,
+            "target_b": self.targets[t2].id,
+            "distance": float(dist),
+            "distance_exact": _sqrt_str(dist_sq),
+            "distance_squared_exact": _frac_str(dist_sq),
+            "required_clearance": self.clearance,
+            "satisfied": not conflict,
+            "witness": w,
+        }
+
+    def _viable_spares(self, bad: Edge, fixed: List[Edge],
+                       reserved: Dict[Edge, Edge]) -> List[Edge]:
+        """Standby edges for ``bad``'s arm when its target alone is lost.
+
+        A standby must be reachable, on ``bad``'s arm, unused by the fixed
+        plan, and compatible with every other fixed segment (checked
+        directly; an edge merely excluded from the *main* matching may still
+        serve as a standby).  Ordered by the takeover tie-break.
+        """
+        i, j = bad
+        used_targets = {h for _, h in fixed}
+        reserved_spare = reserved.get(bad)
+        if (reserved_spare is not None
+                and reserved_spare[1] not in used_targets):
+            # The reservation's closure already forbids every main edge that
+            # could clash with the standby segment (and any other arm using
+            # its target), so it stays a valid rescue in every descendant.
+            return [reserved_spare]
+        spares = []
+        for jp in range(self.n_targets):
+            if jp == j or jp in used_targets or self.len2[i][jp] is None:
+                continue
+            standby = (i, jp)
+            if all(self._spare_ok(standby, e) for e in fixed if e != bad):
+                spares.append(standby)
+        spares.sort(key=lambda e: (-self.targets[e[1]].priority,
+                                  self.len2[e[0]][e[1]], e[1]))
+        return spares
+
+    def _takeover_options(self, used_targets: Sequence[bool],
+                         fixed: List[Edge]) -> Dict[Edge, List[Edge]]:
+        """For every fixed allocation ``(i, j)`` the ordered list of viable
+        standby edges ``(i, j')`` when target ``j`` alone is lost: ``j'`` must
+        be reachable from arm ``i``, unused by the main plan, and compatible
+        with every fixed segment.  Ordered per the takeover tie-break: spare
+        target priority (descending), extension squared (ascending), target
+        submission index (ascending)."""
+        options: Dict[Edge, List[Edge]] = {}
+        for (i, j) in fixed:
+            spares = []
+            for jp in range(self.n_targets):
+                if jp == j or used_targets[jp] or self.len2[i][jp] is None:
+                    continue
+                standby = (i, jp)
+                if all(self._spare_ok(standby, e) for e in fixed
+                       if e != (i, j)):
+                    spares.append(standby)
+            spares.sort(key=lambda e: (-self.targets[e[1]].priority,
+                                      self.len2[e[0]][e[1]], e[1]))
+            options[(i, j)] = spares
+        return options
+
+    def _uncertified(self, chosen: List[Edge],
+                     reserved: Dict[Edge, Edge]
+                     ) -> Optional[Tuple[Edge, List[Edge]]]:
+        """The first fixed allocation (arm submission order) that has no viable
+        takeover, plus *all* reachable standby candidates for its arm
+        (tie-break ordered).  Standby targets currently owned by another edge
+        are included: reserving such a standby carries a closure that forbids
+        the owner edge (and every edge clashing with the standby segment), so
+        every candidate child strictly restricts the node."""
+        if not self.require_takeover:
+            return None
+        chosen = sorted(chosen)
+        for edge in chosen:
+            if self._viable_spares(edge, chosen, reserved):
+                continue
+            i, j = edge
+            # All reachable standbys are enumerated: standbys blocked by an
+            # owner or a clashing fixed edge carry a closure that forbids that
+            # edge, so each reservation genuinely restricts the node.
+            candidates = [(i, jp) for jp in range(self.n_targets)
+                          if jp != j and self.len2[i][jp] is not None]
+            candidates.sort(key=lambda e: (-self.targets[e[1]].priority,
+                                          self.len2[e[0]][e[1]], e[1]))
+            return edge, candidates
+        return None
+
+    def _spare_closure(self, bad: Edge, spare: Edge) -> FrozenSet[Edge]:
+        """Restrictions imposed on a main plan that keeps ``bad`` and rescues
+        it with ``spare`` when its target is lost: arm ``bad``'s arm carries
+        ``bad`` (every other edge on that arm is out), the spare target stays
+        free (no other arm may use it), and nothing in the plan may collide
+        with the standby segment."""
+        bi, bj = bad
+        si, sj = spare
+        assert si == bi
+        forced: set = set()
+        for jj in range(self.n_targets):
+            if jj != bj and self.len2[bi][jj] is not None:
+                forced.add((bi, jj))
+        for ii in range(self.n_arms):
+            if ii != bi and self.len2[ii][sj] is not None:
+                forced.add((ii, sj))
+        for (k, h) in self.edges:
+            if k == bi:
+                continue
+            a, b = (bi, k) if bi < k else (k, bi)
+            t1, t2 = (sj, h) if bi < k else (h, sj)
+            if self.pair_info(a, t1, b, t2)[0]:
+                forced.add((k, h))
+        return frozenset(forced)
+
     def _branch_edge(self, chosen: List[Edge]) -> Edge:
         """Pick the chosen edge participating in the most internal clashes;
         ties broken by arm then target order."""
@@ -225,30 +383,50 @@ class Solver:
         return total, chosen
 
     # ------------------------------------------------------------------
-    # Branch and bound on collision pairs
+    # Branch and bound on collision pairs (and takeover certification)
     # ------------------------------------------------------------------
     def solve(self) -> Tuple[Tuple[int, ...], bool, Optional[dict]]:
         # Feasible incumbent from deterministic greedy seeds (enables pruning
         # at the root); then exact collision branching proves optimality.
-        incumbent = self._greedy_seed()
+        if self.require_takeover:
+            # Search only admits certifiable solutions; start from the best
+            # certifiable incumbent (certified greedy passes + the trimmed
+            # unconstrained seed) so the root prunes aggressively.
+            cert_seeds = self._certified_greedy_seeds()
+            cert_seeds.append(self._certifiable_seed(self._greedy_seed()))
+            incumbent = max(cert_seeds, key=self.matching_weight)
+        else:
+            incumbent = self._greedy_seed()
         best_value = self.matching_weight(incumbent)
         best_assignment = incumbent[:]
         stats = {"nodes": 0}
-        memo: Dict[FrozenSet[Edge], Tuple[int, List[Edge]]] = {}
+        matching_cache: Dict[FrozenSet[Edge], Tuple[int, List[Edge]]] = {}
+        Reserved = Dict[Edge, Edge]
 
-        def recurse(forbidden: FrozenSet[Edge]) -> None:
+        def recurse(forbidden: FrozenSet[Edge],
+                    reserved: Reserved) -> None:
             nonlocal best_value, best_assignment
             stats["nodes"] += 1
-            cached = memo.get(forbidden)
+            # A reservation is void once its main-plan edge is excluded.
+            # (The reserved standby edge itself is expected to be forbidden
+            # from the main matching -- that does not void it.)
+            reserved = {b: s for b, s in reserved.items()
+                        if b not in forbidden}
+
+            cached = matching_cache.get(forbidden)
             if cached is not None:
                 bound, chosen = cached
             else:
                 bound, chosen = self._relaxed_match(forbidden)
-                memo[forbidden] = (bound, chosen)
+                matching_cache[forbidden] = (bound, chosen)
             if bound <= best_value:
                 return  # cannot improve the incumbent
-            if self._first_conflict(chosen) is None:
-                # Relaxed optimum is collision-free -> true optimum of node.
+            conflict = self._first_conflict(chosen)
+            uncertified = (self._uncertified(chosen, reserved)
+                           if conflict is None else None)
+            if conflict is None and uncertified is None:
+                # Relaxed optimum is collision-free and takeover-certified ->
+                # the true optimum among certifiable plans at this node.
                 assignment = [-1] * self.n_arms
                 for i, j in chosen:
                     assignment[i] = j
@@ -256,32 +434,53 @@ class Solver:
                 best_assignment = assignment
                 return
 
-            edge = self._branch_edge(chosen)
-            ei, ej = edge
-            # Branch 1: include ``edge`` -> forbid every other edge on its
-            # arm or target, and every edge in the whole graph that collides
-            # with it.
-            forced: set = set(forbidden)
-            for jj in range(self.n_targets):
-                if jj != ej and self.len2[ei][jj] is not None:
-                    forced.add((ei, jj))
-            for ii in range(self.n_arms):
-                if ii != ei and self.len2[ii][ej] is not None:
-                    forced.add((ii, ej))
-            for (k, h) in self.edges:
-                if k == ei:
-                    continue
-                a, b = (ei, k) if ei < k else (k, ei)
-                t1, t2 = (ej, h) if ei < k else (h, ej)
-                if self.pair_info(a, t1, b, t2)[0]:
-                    forced.add((k, h))
-            recurse(frozenset(forced))
-            if best_value == bound:
-                return  # reached the node's upper bound
-            # Branch 2: exclude ``edge``.
-            recurse(forbidden | {edge})
+            if conflict is not None:
+                edge = self._branch_edge(chosen)
+                ei, ej = edge
+                # Branch 1: include ``edge`` -> forbid every other edge on
+                # its arm or target, and every edge that collides with it.
+                forced: set = set(forbidden)
+                for jj in range(self.n_targets):
+                    if jj != ej and self.len2[ei][jj] is not None:
+                        forced.add((ei, jj))
+                for ii in range(self.n_arms):
+                    if ii != ei and self.len2[ii][ej] is not None:
+                        forced.add((ii, ej))
+                for (k, h) in self.edges:
+                    if k == ei:
+                        continue
+                    a, b = (ei, k) if ei < k else (k, ei)
+                    t1, t2 = (ej, h) if ei < k else (h, ej)
+                    if self.pair_info(a, t1, b, t2)[0]:
+                        forced.add((k, h))
+                children_forbidden = [frozenset(forced),
+                                      forbidden | {edge}]
+                children_reserved = [reserved, reserved]
+            else:
+                # Collision-free but ``bad`` lacks a takeover.  Every
+                # certifiable completion either reserves one of the spare
+                # candidates (tie-break order; the closure forbids the spare
+                # from the main plan and every segment clashing with it) or
+                # drops ``bad``.  Each child strictly grows ``forbidden``.
+                bad, candidates = uncertified
+                children_forbidden = []
+                children_reserved = []
+                for spare in candidates:
+                    new_reserved = dict(reserved)
+                    new_reserved[bad] = spare
+                    children_forbidden.append(
+                        forbidden | self._spare_closure(bad, spare))
+                    children_reserved.append(new_reserved)
+                children_forbidden.append(forbidden | {bad})
+                children_reserved.append(reserved)
 
-        recurse(frozenset())
+            for child_forbidden, child_reserved in zip(children_forbidden,
+                                                       children_reserved):
+                recurse(child_forbidden, child_reserved)
+                if best_value == bound:
+                    return  # reached the node's upper bound
+
+        recurse(frozenset(), {})
         self.solve_stats = stats
 
         best_tuple = tuple(best_assignment)
@@ -331,6 +530,80 @@ class Solver:
         candidates.append(greedy(constrained, lambda i, j: self.len2[i][j]))
         return max(candidates, key=self.matching_weight)
 
+    def _certifiable_seed(self, seed: List[int]) -> List[int]:
+        """Trim a feasible seed until every surviving allocation has a
+        takeover.  Removing an edge only frees targets and removes fixed
+        segments, so this terminates (the empty plan is trivially certifiable);
+        it merely supplies a pruning incumbent for the certified search."""
+        assignment = seed[:]
+        while True:
+            fixed = sorted((i, j) for i, j in enumerate(assignment) if j >= 0)
+            used_targets = [False] * self.n_targets
+            for _, j in fixed:
+                used_targets[j] = True
+            options = self._takeover_options(used_targets, fixed)
+            bad_edge = next((e for e in fixed if not options[e]), None)
+            if bad_edge is None:
+                return assignment
+            assignment[bad_edge[0]] = -1
+
+    def _certified_greedy_seeds(self) -> List[List[int]]:
+        """Deterministic greedy passes that only accept an edge when the whole
+        partial plan stays collision-free *and* certifiable, yielding strong
+        (often near-optimal) incumbents for aggressive pruning."""
+        n, m = self.n_arms, self.n_targets
+        seeds: List[List[int]] = []
+
+        def run(arm_order, target_key):
+            assignment = [-1] * n
+            used = [False] * m
+            placed: List[Edge] = []
+
+            def stays_certified():
+                used_flags = [False] * m
+                for _, jj in placed:
+                    used_flags[jj] = True
+                options = self._takeover_options(used_flags, placed)
+                return all(options[e] for e in placed)
+
+            for i in arm_order:
+                for j in sorted((jj for jj in range(m)
+                                 if self.len2[i][jj] is not None
+                                 and not used[jj]),
+                                key=lambda jj, i=i: target_key(i, jj)):
+                    clash = any(
+                        self.pair_info(*self._ordered(i, j, k, h))[0]
+                        for k, h in placed)
+                    if clash:
+                        continue
+                    placed.append((i, j))
+                    if stays_certified():
+                        assignment[i] = j
+                        used[j] = True
+                    else:
+                        placed.pop()
+            return assignment
+
+        seeds.append(run(range(n), lambda i, j: j))
+        constrained = sorted(
+            range(n),
+            key=lambda i: (sum(1 for d2 in self.len2[i] if d2 is not None), i))
+        seeds.append(run(constrained, lambda i, j: -self.targets[j].priority))
+        seeds.append(run(constrained, lambda i, j: self.len2[i][j]))
+        # Arms with many reachable options first: they are least likely to
+        # monopolise a unique standby later.
+        flexible = sorted(
+            range(n),
+            key=lambda i: (-sum(1 for d2 in self.len2[i] if d2 is not None), i))
+        seeds.append(run(flexible, lambda i, j: j))
+        return seeds
+
+    @staticmethod
+    def _ordered(i: int, j: int, k: int, h: int) -> Tuple[int, int, int, int]:
+        a, b = (i, k) if i < k else (k, i)
+        t1, t2 = (j, h) if i < k else (h, j)
+        return a, t1, b, t2
+
     # ------------------------------------------------------------------
     # Shortfall explanation
     # ------------------------------------------------------------------
@@ -369,6 +642,136 @@ class Solver:
     # ------------------------------------------------------------------
     # Result assembly with evidence
     # ------------------------------------------------------------------
+    def _scenario(self, edge: Edge, fixed: List[Edge],
+                  spares: List[Edge], with_blockers: bool = False) -> dict:
+        """Assemble the single-target-loss scenario for one fixed allocation.
+
+        ``spares`` is the ordered list of viable standby edges (empty when the
+        allocation cannot be certified).  With ``with_blockers`` the empty case
+        additionally reports, for every free reachable standby candidate, the
+        first fixed pairing that blocks it with exact clearance evidence.
+        """
+        i, j = edge
+        fixed_pairs = [{
+            "arm_id": self.arms[k].id,
+            "target_id": self.targets[h].id,
+            "extension_sq": self.len2[k][h],
+        } for k, h in fixed if (k, h) != edge]
+
+        reassignment = None
+        evidence: List[dict] = []
+        if spares:
+            si, sj = spares[0]
+            d2 = self.len2[si][sj]
+            reassignment = {
+                "arm_id": self.arms[si].id,
+                "lost_target_id": self.targets[j].id,
+                "spare_target_id": self.targets[sj].id,
+                "extension": float(d2 ** 0.5),
+                "extension_sq": d2,
+                "priority": self.targets[sj].priority,
+            }
+            for e in fixed:
+                if e == edge:
+                    continue
+                evidence.append(self._spare_witness((si, sj), e))
+
+        blocked = None
+        if with_blockers and not spares:
+            used_targets = {h for _, h in fixed}
+            candidates = []
+            for jp in range(self.n_targets):
+                if jp in used_targets or self.len2[i][jp] is None:
+                    continue
+                candidates.append((i, jp))
+            candidates.sort(key=lambda e: (-self.targets[e[1]].priority,
+                                          self.len2[e[0]][e[1]], e[1]))
+            blocked = []
+            for standby in candidates:
+                si, sj = standby
+                blocker = next(e for e in fixed
+                               if e != edge and not self._spare_ok(standby, e))
+                bk, bh = blocker
+                blocked.append({
+                    "arm_id": self.arms[si].id,
+                    "spare_target_id": self.targets[sj].id,
+                    "extension_sq": self.len2[si][sj],
+                    "priority": self.targets[sj].priority,
+                    "blocked_by_arm": self.arms[bk].id,
+                    "blocked_by_target": self.targets[bh].id,
+                    "clearance": self._spare_witness(standby, blocker),
+                })
+
+        return {
+            "arm_id": self.arms[i].id,
+            "lost_target_id": self.targets[j].id,
+            "reassignment": reassignment,
+            "fixed_pairings": fixed_pairs,
+            "clearance_evidence": evidence,
+            "blocked_candidates": blocked,
+        }
+
+    def _plain_optimum(self) -> Tuple[int, ...]:
+        """The certification-free (but collision-aware) lexicographic optimum
+        of the same instance, solved once and cached."""
+        cached = getattr(self, "_plain_optimum_cache", None)
+        if cached is None:
+            plain = Solver(self.arms, self.targets, self.clearance,
+                           self.minimum_allocations, require_takeover=False)
+            cached, _, _ = plain.solve()
+            self._plain_optimum_cache = cached
+        return cached
+
+    def build_takeover_report(self, assignment: Sequence[int],
+                              feasible: bool) -> dict:
+        """Per-target-loss report for the certified search result.
+
+        Always lists one scenario per fixed allocation (arm submission order):
+        the selected standby pairing, the unchanged fixed pairings and exact
+        per-pair clearance evidence.  When the certified optimum is below the
+        requested minimum, additionally reports that maximum certified
+        allocation count and the first blocking scenario of a maximal
+        conflict-free candidate, with every free reachable standby candidate
+        and the fixed pairing that blocks it.
+        """
+        fixed = sorted((i, j) for i, j in enumerate(assignment) if j >= 0)
+        used_targets = [False] * self.n_targets
+        for _, j in fixed:
+            used_targets[j] = True
+        options = self._takeover_options(used_targets, fixed)
+        scenarios = [self._scenario(e, fixed, options[e]) for e in fixed]
+        fully = all(options[e] for e in fixed)
+
+        first_blocking = None
+        max_certified: Optional[int] = None
+        if not feasible:
+            # Exhibit why a larger plan cannot be certified.  The
+            # certification-free optimum, if it exceeds the certified optimum,
+            # must be non-certifiable, so its first uncertifiable scenario is
+            # the blocking witness.
+            plain_assignment = self._plain_optimum()
+            candidate = sorted((i, j) for i, j in enumerate(plain_assignment)
+                               if j >= 0)
+            if len(candidate) > len(fixed):
+                cand_used = [False] * self.n_targets
+                for _, j in candidate:
+                    cand_used[j] = True
+                cand_options = self._takeover_options(cand_used, candidate)
+                uncert = [e for e in candidate if not cand_options[e]]
+                if uncert:
+                    first_blocking = self._scenario(
+                        uncert[0], candidate, [], with_blockers=True)
+            max_certified = len(fixed)
+
+        return {
+            "enabled": True,
+            "fully_certified": fully,
+            "num_scenarios": len(scenarios),
+            "scenarios": scenarios,
+            "first_blocking_scenario": first_blocking,
+            "max_certified_allocations": max_certified,
+        }
+
     def build_result(self, assignment: Sequence[int], feasible: bool,
                      witness: Optional[dict]) -> SolveResult:
         pairs: List[dict] = []
@@ -432,6 +835,16 @@ class Solver:
                 cause = "fewer arms/targets than the requested minimum"
             elif self.total_reachable < self.minimum_allocations:
                 cause = "not every arm has a reachable target"
+            elif self.require_takeover and \
+                    sum(1 for x in self._plain_optimum() if x >= 0) \
+                    < self.minimum_allocations:
+                cause = ("pairwise segment clearance / reachability restricts "
+                         "the compatible set below the requested minimum")
+            elif self.require_takeover:
+                cause = ("single-target-loss takeover certification "
+                         "(every fixed pairing must keep a reachable spare "
+                         "compatible with the unchanged pairings) restricts "
+                         "the certifiable set below the requested minimum")
             else:
                 cause = ("pairwise segment clearance / reachability restricts "
                          "the compatible set below the requested minimum")

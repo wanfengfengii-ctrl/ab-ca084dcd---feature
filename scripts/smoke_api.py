@@ -8,7 +8,12 @@ It waits for readiness and exercises:
 2. an instance where pairwise collisions make the requested minimum
    impossible: the API must return the maximum achievable count and a clear
    reason (HTTP 200, status minimum_not_met);
-3. an illegal payload that must be rejected with HTTP 422 without solving.
+3. an illegal payload that must be rejected with HTTP 422 without solving;
+4. single-target-loss takeover certification: a certifiable instance with one
+   standby per arm (per-target reassignment, preserved fixed pairings and
+   standby clearance evidence), a non-certifiable instance (maximum certified
+   count plus the first blocking scenario), and backward compatibility when
+   the feature is not enabled.
 
 Exits 0 on success, 1 on any failure.
 """
@@ -80,6 +85,29 @@ def collision_payload():
             "clearance": 3, "minimum_allocations": 6}
 
 
+def takeover_certifiable_payload():
+    # Six far-apart arms with a main target and a dedicated standby each.
+    arms = [{"id": f"A{i}", "x": i * 1000, "y": 0, "max_extension": 500}
+            for i in range(6)]
+    targets = [{"id": f"T{i}", "x": i * 1000 + 10, "y": 0, "priority": i + 1}
+               for i in range(6)]
+    targets += [{"id": f"S{i}", "x": i * 1000 - 10, "y": 0, "priority": 1}
+                for i in range(6)]
+    return {"arms": arms, "targets": targets, "clearance": 5,
+            "minimum_allocations": 6, "takeover": {"enabled": True}}
+
+
+def takeover_uncertifiable_payload():
+    # Each arm reaches exactly one target: the six-pair plain plan cannot be
+    # certified at all, so the maximum certified allocation count is zero.
+    arms = [{"id": f"A{i}", "x": i * 1000, "y": 0, "max_extension": 500}
+            for i in range(6)]
+    targets = [{"id": f"T{i}", "x": i * 1000 + 10, "y": 0, "priority": i + 1}
+               for i in range(6)]
+    return {"arms": arms, "targets": targets, "clearance": 5,
+            "minimum_allocations": 6, "takeover": {"enabled": True}}
+
+
 def main():
     wait_ready()
     print("readiness OK")
@@ -134,6 +162,55 @@ def main():
     bad["arms"] = bad["arms"][:5]
     request("POST", "/api/v1/adjudicate", bad, expect=(422,))
     print("illegal input rejected with 422")
+
+    # 4a) takeover: certifiable plan with one standby per arm
+    _, body = request("POST", "/api/v1/adjudicate",
+                      takeover_certifiable_payload())
+    assert body["status"] == "ok" and body["feasible"] is True, body
+    tk = body["takeover"]
+    assert tk["enabled"] is True and tk["fully_certified"] is True, tk
+    assert tk["num_scenarios"] == 6
+    assert tk["max_certified_allocations"] is None
+    assert tk["first_blocking_scenario"] is None
+    plan = {p["arm_id"]: p["target_id"] for p in body["assignments"]}
+    assert len(plan) == 6
+    for sc in tk["scenarios"]:
+        arm, ra = sc["arm_id"], sc["reassignment"]
+        assert ra is not None and ra["arm_id"] == arm
+        assert ra["lost_target_id"] == plan[arm]
+        assert ra["spare_target_id"].startswith("S")
+        assert math.isclose(ra["extension"] ** 2, ra["extension_sq"],
+                            rel_tol=1e-12)
+        fixed = {p["arm_id"]: p["target_id"] for p in sc["fixed_pairings"]}
+        assert fixed == {a: t for a, t in plan.items() if a != arm}
+        assert len(sc["clearance_evidence"]) == 5
+        for ev in sc["clearance_evidence"]:
+            assert ev["satisfied"] is True
+            assert ev["distance"] + EPS >= ev["required_clearance"]
+    print("takeover certifiable case OK: 6 scenarios with standby + evidence")
+
+    # 4b) takeover: nothing certifiable -> max certified count + blocker
+    _, body = request("POST", "/api/v1/adjudicate",
+                      takeover_uncertifiable_payload())
+    assert body["status"] == "minimum_not_met", body
+    assert body["feasible"] is False
+    assert body["objective"]["num_allocations"] == 0, body["objective"]
+    tk = body["takeover"]
+    assert tk["max_certified_allocations"] == 0
+    fbs = tk["first_blocking_scenario"]
+    assert fbs is not None and fbs["arm_id"] == "A0"
+    assert fbs["lost_target_id"] == "T0"
+    assert fbs["reassignment"] is None
+    print("takeover shortfall OK: max certified=0 with first blocking "
+          "scenario")
+
+    # 4c) backward compatibility: no takeover key in request/response
+    payload = takeover_certifiable_payload()
+    payload.pop("takeover")
+    _, body = request("POST", "/api/v1/adjudicate", payload)
+    assert body.get("takeover") is None
+    assert body["objective"]["takeover_certification"] == "disabled"
+    print("takeover backward compatibility OK")
 
     print("SMOKE: PASS")
     return 0

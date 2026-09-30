@@ -151,3 +151,102 @@ def test_maximum_size_instance_accepted(client):
     assert body["objective"]["num_allocations"] >= 1
     for p in body["clearance"]["pair_evidence"]:
         assert p["distance"] + 1e-9 >= p["required_clearance"]
+
+
+# ----------------------------------------------------------------------
+# Single-target-loss takeover
+# ----------------------------------------------------------------------
+def certified_payload(**overrides):
+    # Six far-apart arms, each with a main target and a dedicated standby.
+    payload = {
+        "arms": [{"id": f"A{i}", "x": i * 1000, "y": 0, "max_extension": 500}
+                 for i in range(6)],
+        "targets": (
+            [{"id": f"T{i}", "x": i * 1000 + 10, "y": 0, "priority": i + 1}
+             for i in range(6)]
+            + [{"id": f"S{i}", "x": i * 1000 - 10, "y": 0, "priority": 1}
+               for i in range(6)]
+        ),
+        "clearance": 5,
+        "minimum_allocations": 6,
+        "takeover": {"enabled": True},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_takeover_absent_or_disabled_is_backward_compatible(client):
+    payload = certified_payload()
+    payload.pop("takeover")
+    body = client.post("/api/v1/adjudicate", json=payload).json()
+    assert body["takeover"] is None
+    assert body["objective"]["takeover_certification"] == "disabled"
+
+    payload["takeover"] = {"enabled": False}
+    body = client.post("/api/v1/adjudicate", json=payload).json()
+    assert body["takeover"] is None
+
+    payload["takeover"] = {}
+    body = client.post("/api/v1/adjudicate", json=payload).json()
+    assert body["takeover"] is None
+
+
+def test_takeover_enabled_returns_per_target_scenarios(client):
+    r = client.post("/api/v1/adjudicate", json=certified_payload())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "ok" and body["feasible"] is True
+    tk = body["takeover"]
+    assert tk["enabled"] is True and tk["fully_certified"] is True
+    assert tk["num_scenarios"] == 6
+    assert tk["max_certified_allocations"] is None
+    assert tk["first_blocking_scenario"] is None
+    plan = {p["arm_id"]: p["target_id"] for p in body["assignments"]}
+    for sc in tk["scenarios"]:
+        arm = sc["arm_id"]
+        reassign = sc["reassignment"]
+        assert reassign["arm_id"] == arm
+        assert reassign["lost_target_id"] == plan[arm]
+        assert reassign["spare_target_id"].startswith("S")
+        # the other five pairings are preserved exactly
+        assert len(sc["fixed_pairings"]) == 5
+        fixed = {p["arm_id"]: p["target_id"] for p in sc["fixed_pairings"]}
+        assert fixed == {a: t for a, t in plan.items() if a != arm}
+        # standby clearance evidence vs every fixed pairing
+        assert len(sc["clearance_evidence"]) == 5
+        for ev in sc["clearance_evidence"]:
+            assert ev["satisfied"] is True
+            assert ev["distance"] + 1e-9 >= ev["required_clearance"]
+            assert ev["witness"]["point_on_first"]
+
+
+def test_takeover_shortfall_reports_max_and_first_blocking(client):
+    # Every arm reaches only one far-apart target: plain plan has 6 pairs but
+    # none can be certified, so the certified maximum is 0.
+    payload = certified_payload()
+    payload["targets"] = [
+        {"id": f"T{i}", "x": i * 1000 + 10, "y": 0, "priority": i + 1}
+        for i in range(6)]
+    r = client.post("/api/v1/adjudicate", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "minimum_not_met"
+    assert body["feasible"] is False
+    assert body["objective"]["num_allocations"] == 0
+    tk = body["takeover"]
+    assert tk["fully_certified"] is True  # vacuous at zero allocations
+    assert tk["max_certified_allocations"] == 0
+    fbs = tk["first_blocking_scenario"]
+    assert fbs is not None and fbs["arm_id"] == "A0"
+    assert fbs["lost_target_id"] == "T0"
+    assert fbs["reassignment"] is None
+
+
+def test_takeover_input_validation(client):
+    payload = certified_payload()
+    payload["takeover"] = {"enabled": True, "bogus": 1}
+    assert client.post("/api/v1/adjudicate", json=payload).status_code == 422
+    payload["takeover"] = {"enabled": "yes"}
+    assert client.post("/api/v1/adjudicate", json=payload).status_code == 422
+    payload["takeover"] = True
+    assert client.post("/api/v1/adjudicate", json=payload).status_code == 422

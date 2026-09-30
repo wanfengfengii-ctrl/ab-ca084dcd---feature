@@ -60,11 +60,17 @@ def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
             for a in req.arms]
     targets = [Target(id=t.id, x=t.x, y=t.y, priority=t.priority)
                for t in req.targets]
+    takeover_enabled = bool(req.takeover and req.takeover.enabled)
     solver = Solver(arms, targets,
                     clearance=req.clearance,
-                    minimum_allocations=req.minimum_allocations)
+                    minimum_allocations=req.minimum_allocations,
+                    require_takeover=takeover_enabled)
     assignment, feasible, witness = solver.solve()
     r = solver.build_result(assignment, feasible, witness)
+
+    takeover_report = None
+    if takeover_enabled:
+        takeover_report = solver.build_takeover_report(assignment, feasible)
 
     return AdjudicateResponse(
         status="ok" if feasible else "minimum_not_met",
@@ -80,6 +86,9 @@ def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
                 "minimize_extension_sq_sum",
                 "stable_sequence",
             ],
+            "takeover_certification": (
+                "every_allocation_requires_a_single_loss_takeover"
+                if takeover_enabled else "disabled"),
         },
         assignments=r.assignments,
         unassigned_arms=r.unassigned_arms,
@@ -99,6 +108,7 @@ def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
             "targets_submitted": len(targets),
         },
         witness=r.witness,
+        takeover=takeover_report,
     )
 
 
