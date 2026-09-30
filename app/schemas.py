@@ -34,6 +34,11 @@ class AdjudicateRequest(StrictModel):
     targets: List[TargetIn] = Field(..., min_length=6, max_length=16)
     clearance: int = Field(..., ge=1)
     minimum_allocations: int = Field(..., ge=1)
+    # When enabled, the selected main plan is certified for single-target
+    # loss takeover: every allocated target keeps a substitute the freed arm
+    # can switch to while all other pairs stay fixed.  When absent/false the
+    # request behaves exactly as before (backwards compatible).
+    single_target_loss_takeover: bool = False
 
     @model_validator(mode="after")
     def _unique_ids(self) -> "AdjudicateRequest":
@@ -85,6 +90,48 @@ class ShortfallWitness(BaseModel):
     reachable_arm_target_links: int
 
 
+class TakeoverReplacement(BaseModel):
+    arm_id: str
+    target_id: str
+    extension: float
+    extension_sq: int
+
+
+class TakeoverFixedPair(BaseModel):
+    arm_id: str
+    target_id: str
+
+
+class TakeoverScenario(BaseModel):
+    arm_id: str
+    lost_target_id: str
+    replacement: TakeoverReplacement
+    fixed_pairs: List[TakeoverFixedPair]
+    pair_evidence: List[PairClearance]
+
+
+class BlockedCandidate(BaseModel):
+    target_id: str
+    extension_sq: int
+    blocked_by: Optional[PairClearance] = None
+
+
+class TakeoverBlocker(BaseModel):
+    arm_id: str
+    lost_target_id: str
+    reason: str
+    blocked_candidates: List[BlockedCandidate]
+
+
+class TakeoverReport(BaseModel):
+    enabled: bool
+    certified: bool
+    max_certifiable_allocations: int
+    requested_minimum_allocations: int
+    scenarios: List[TakeoverScenario] = []
+    first_blocking_scenario: Optional[TakeoverBlocker] = None
+
+
 class AdjudicateResponse(BaseModel):
     status: str  # "ok" | "minimum_not_met"
     feasible: bool
@@ -97,3 +144,4 @@ class AdjudicateResponse(BaseModel):
     clearance: dict
     limits: dict
     witness: Optional[ShortfallWitness] = None
+    takeover: Optional[TakeoverReport] = None

@@ -289,7 +289,18 @@ class Solver:
         witness = None
         if count < self.minimum_allocations:
             witness = self._shortfall_witness()
-        return best_tuple, count >= self.minimum_allocations, witness
+        result = (best_tuple, count >= self.minimum_allocations, witness)
+        self._last_plain = result
+        return result
+
+    def last_plain_solution(self) -> Tuple[Tuple[int, ...], bool,
+                                           Optional[dict]]:
+        """Cached result of the latest :meth:`solve` call (run it if the
+        cached value is absent)."""
+        cached = getattr(self, "_last_plain", None)
+        if cached is None:
+            return self.solve()
+        return cached
 
     # ------------------------------------------------------------------
     # Greedy feasible seeds
@@ -367,8 +378,362 @@ class Solver:
         }
 
     # ------------------------------------------------------------------
+    # Single-target-loss takeover certification
+    # ------------------------------------------------------------------
+    # A main plan is *certifiable* when every allocated edge (i0, j0) has a
+    # takeover target j' that is unused by the whole main plan, reachable from
+    # arm i0, and keeps the required clearance from every fixed pair (all
+    # pairs except (i0, j0)).  The same spare target may serve as backup in
+    # several different loss scenarios; it only has to stay unoccupied inside
+    # one concrete scenario.
+    def replacement_targets(self, placed: Sequence[Edge],
+                            edge: Edge) -> List[int]:
+        """Candidate substitute target indices for losing ``edge``.
+
+        ``placed`` is the main plan (including ``edge`` itself).  A candidate
+        must be unused by the main plan, reachable from the arm that owned the
+        lost target, and clear of every fixed pair.  Equality with the
+        clearance limit counts as feasible (conflict is strict ``<``).
+        """
+        i0, _ = edge
+        used = {j for _, j in placed}
+        fixed = [g for g in placed if g != edge]
+        candidates: List[int] = []
+        for jp in range(self.n_targets):
+            if jp in used or self.len2[i0][jp] is None:
+                continue
+            clash = False
+            for (k, h) in fixed:
+                a, b = (i0, k) if i0 < k else (k, i0)
+                t1, t2 = (jp, h) if i0 < k else (h, jp)
+                if self.pair_info(a, t1, b, t2)[0]:
+                    clash = True
+                    break
+            if not clash:
+                candidates.append(jp)
+        return candidates
+
+    @staticmethod
+    def _substitute_key(targets: Sequence[Target], len2, arm: int):
+        # Scenario tie-breaking: priority desc, squared extension asc,
+        # then submitted target index asc.
+        return lambda jp: (-targets[jp].priority, len2[arm][jp], jp)
+
+    def _cert_plan_is_valid(self, placed: List[Edge]) -> bool:
+        return all(self.replacement_targets(placed, e) for e in placed)
+
+    def _cert_seed_from_plan(self, assignment: Sequence[int]) -> List[int]:
+        """Drop non-certifiable edges from a feasible plan until what remains
+        is certifiable (a feasible lower bound for the branch-and-bound)."""
+        result = list(assignment)
+        while True:
+            placed = sorted((i, j) for i, j in enumerate(result) if j >= 0)
+            failing = next((e for e in placed
+                            if not self.replacement_targets(placed, e)), None)
+            if failing is None:
+                return result
+            result[failing[0]] = -1
+
+    def solve_certified(self) -> Tuple[int, ...]:
+        """Lexicographically optimal *certifiable* main plan.
+
+        Same four-level order as :meth:`solve`, but the search space is
+        restricted to plans where each placed edge keeps at least one live
+        takeover target.  Branch-and-bound extends the collision branching:
+
+        * viability prune -- once an edge is forced in, its possible backup
+          set can only shrink as more edges join, so a forced edge without a
+          geometrically possible backup prunes the whole node;
+        * rescue branching -- when the collision-free relaxed optimum places
+          an edge ``e`` without any surviving backup, a certifiable solution
+          either drops ``e`` or keeps one concrete backup target alive (which
+          forbids every relaxed-optimum edge that occupies that target or
+          collides with the backup segment).  Branches yielding the same
+          forbidden set are merged: the backup target itself is never part
+          of the plan, so only the existence of *some* surviving backup
+          matters.
+        """
+        # Fast path: the ordinary optimum is usually certifiable.  Solving it
+        # first also yields a strong feasible seed for the restricted search.
+        plain, _, _ = self.solve()
+        plain_placed = sorted((i, j) for i, j in enumerate(plain) if j >= 0)
+        if all(self.replacement_targets(plain_placed, e) for e in plain_placed):
+            self.cert_stats = {"nodes": 0, "fast_path": True}
+            return plain
+
+        seeds = [self._cert_seed_from_plan(plain)]
+        seeds += [
+            self._cert_greedy_seed(),
+        ]
+        best_assignment = max(seeds, key=self.matching_weight)
+        best_value = self.matching_weight(best_assignment)
+        relaxed_memo: Dict[FrozenSet[Edge], Tuple[int, List[Edge]]] = {}
+        viability_memo: Dict[FrozenSet[Edge], bool] = {}
+        stats = {"nodes": 0}
+
+        def viable(included: FrozenSet[Edge]) -> bool:
+            cached = viability_memo.get(included)
+            if cached is not None:
+                return cached
+            ok = True
+            if included:
+                placed = sorted(included)
+                ok = all(self.replacement_targets(placed, e) for e in placed)
+            viability_memo[included] = ok
+            return ok
+
+        def recurse(forbidden: FrozenSet[Edge],
+                    included: FrozenSet[Edge]) -> None:
+            nonlocal best_value, best_assignment
+            stats["nodes"] += 1
+            if not viable(included):
+                return
+            cached = relaxed_memo.get(forbidden)
+            if cached is not None:
+                bound, chosen = cached
+            else:
+                bound, chosen = self._relaxed_match(forbidden)
+                relaxed_memo[forbidden] = (bound, chosen)
+            if bound <= best_value:
+                return
+            if self._first_conflict(chosen) is not None:
+                edge = self._branch_edge(chosen)
+                ei, ej = edge
+                forced: set = set(forbidden)
+                for jj in range(self.n_targets):
+                    if jj != ej and self.len2[ei][jj] is not None:
+                        forced.add((ei, jj))
+                for ii in range(self.n_arms):
+                    if ii != ei and self.len2[ii][ej] is not None:
+                        forced.add((ii, ej))
+                for (k, h) in self.edges:
+                    if k == ei:
+                        continue
+                    a, b = (ei, k) if ei < k else (k, ei)
+                    t1, t2 = (ej, h) if ei < k else (h, ej)
+                    if self.pair_info(a, t1, b, t2)[0]:
+                        forced.add((k, h))
+                recurse(frozenset(forced), included | {edge})
+                if best_value == bound:
+                    return
+                recurse(forbidden | {edge}, included)
+                return
+
+            # Collision-free relaxed optimum -> true optimum of this node
+            # among ordinary plans; it additionally has to be certifiable.
+            chosen_sorted = sorted(chosen)
+            failing = next(
+                (e for e in chosen_sorted
+                 if not self.replacement_targets(chosen_sorted, e)),
+                None,
+            )
+            if failing is None:
+                assignment = [-1] * self.n_arms
+                for i, j in chosen:
+                    assignment[i] = j
+                best_value = bound
+                best_assignment = assignment
+                return
+
+            ei, ej = failing
+            possible = self.replacement_targets(
+                sorted(included | {failing}), failing)
+            # Each rescue branch keeps ``failing`` and reserves one concrete
+            # backup target jp: forbid every other edge on arm ei / target ej
+            # (failing is forced), every edge occupying jp, and every edge in
+            # the whole graph whose segment collides with the would-be backup
+            # segment.  Any certifiable solution that keeps failing certifies
+            # it via exactly such a jp, so the branches plus the final
+            # exclude-failing branch exhaust the solution space.  Identical
+            # forbidden sets (different jp, same effect) are merged.
+            branch_sets: Dict[FrozenSet[Edge], int] = {}
+            for jp in possible:
+                forb: set = set(forbidden)
+                for jj in range(self.n_targets):
+                    if jj != ej and self.len2[ei][jj] is not None:
+                        forb.add((ei, jj))
+                for ii in range(self.n_arms):
+                    if ii != ei and self.len2[ii][ej] is not None:
+                        forb.add((ii, ej))
+                for ii in range(self.n_arms):
+                    if ii != ei and self.len2[ii][jp] is not None:
+                        forb.add((ii, jp))
+                for (k, h) in self.edges:
+                    if k == ei:
+                        continue
+                    a, b = (ei, k) if ei < k else (k, ei)
+                    t1, t2 = (jp, h) if ei < k else (h, jp)
+                    if self.pair_info(a, t1, b, t2)[0]:
+                        forb.add((k, h))
+                bf = frozenset(forb)
+                # The reserved backup edge (ei, jp) itself is reachable and
+                # differs from failing, so at least that edge is newly
+                # forbidden; a non-growing branch would mean jp already
+                # certified failing, contradicting its selection.
+                if bf == forbidden:
+                    continue
+                key_jp = (-self.targets[jp].priority, self.len2[ei][jp], jp)
+                if bf not in branch_sets:
+                    branch_sets[bf] = key_jp
+                else:
+                    branch_sets[bf] = min(branch_sets[bf], key_jp)
+            # Most promising rescue first: fewest added restrictions, then
+            # the best backup representative by scenario priority.
+            ordered = sorted(
+                branch_sets,
+                key=lambda bf: (len(bf), branch_sets[bf]))
+            for forb in ordered:
+                recurse(forb, included | {failing})
+                if best_value == bound:
+                    return
+            # Last resort: the uncertifiable edge must leave the plan.
+            recurse(forbidden | {failing}, included)
+
+        recurse(frozenset(), frozenset())
+        stats["fast_path"] = False
+        self.cert_stats = stats
+        return tuple(best_assignment)
+
+    def _cert_greedy_seed(self) -> List[int]:
+        """Deterministic greedy seeds that are certifiable at every step."""
+        n, m = self.n_arms, self.n_targets
+
+        def greedy(arm_order, target_key) -> List[int]:
+            assignment = [-1] * n
+            used = [False] * m
+            placed: List[Edge] = []
+            for i in arm_order:
+                for j in sorted((j for j in range(m)
+                                 if self.len2[i][j] is not None and not used[j]),
+                                key=lambda j, i=i: target_key(i, j)):
+                    clash = False
+                    for k, h in placed:
+                        a, b = (i, k) if i < k else (k, i)
+                        t1, t2 = (j, h) if i < k else (h, j)
+                        if self.pair_info(a, t1, b, t2)[0]:
+                            clash = True
+                            break
+                    if clash:
+                        continue
+                    trial = placed + [(i, j)]
+                    if all(self.replacement_targets(trial, e)
+                           for e in trial):
+                        assignment[i] = j
+                        used[j] = True
+                        placed = trial
+                        break
+            return assignment
+
+        candidates = [greedy(range(n), lambda i, j: j)]
+        constrained = sorted(
+            range(n),
+            key=lambda i: (sum(1 for d2 in self.len2[i] if d2 is not None), i))
+        candidates.append(greedy(constrained,
+                                 lambda i, j: -self.targets[j].priority))
+        candidates.append(greedy(constrained, lambda i, j: self.len2[i][j]))
+        return max(candidates, key=self.matching_weight)
+
+    def takeover_scenarios(self, assignment: Sequence[int]) -> List[dict]:
+        """Per-lost-target scenario report for a certified main plan."""
+        placed = sorted((i, j) for i, j in enumerate(assignment) if j >= 0)
+        scenarios: List[dict] = []
+        for (i0, j0) in placed:
+            fixed = [e for e in placed if e != (i0, j0)]
+            candidates = self.replacement_targets(placed, (i0, j0))
+            key = self._substitute_key(self.targets, self.len2, i0)
+            jp = min(candidates, key=key)
+            evidence = [self._clearance_record(i0, jp, k, h)
+                        for (k, h) in fixed]
+            scenarios.append({
+                "arm_id": self.arms[i0].id,
+                "lost_target_id": self.targets[j0].id,
+                "replacement": {
+                    "arm_id": self.arms[i0].id,
+                    "target_id": self.targets[jp].id,
+                    "extension": float(self.len2[i0][jp] ** 0.5),
+                    "extension_sq": self.len2[i0][jp],
+                },
+                "fixed_pairs": [
+                    {"arm_id": self.arms[k].id,
+                     "target_id": self.targets[h].id}
+                    for (k, h) in fixed
+                ],
+                "pair_evidence": evidence,
+            })
+        return scenarios
+
+    def first_blocking_scenario(self, assignment: Sequence[int]) -> dict:
+        """First loss scenario (arm submission order) without a takeover.
+
+        Built from an unconstrained optimum that reaches the requested size,
+        to explain why that plan cannot be certified.  Lists every unused
+        reachable target together with the first fixed pair that blocks it.
+        """
+        placed = sorted((i, j) for i, j in enumerate(assignment) if j >= 0)
+        used = {j for _, j in placed}
+        for (i0, j0) in placed:
+            fixed = [e for e in placed if e != (i0, j0)]
+            reachable_unused = [jp for jp in range(self.n_targets)
+                                if jp not in used
+                                and self.len2[i0][jp] is not None]
+            blocked: List[dict] = []
+            for jp in reachable_unused:
+                blocker = None
+                for (k, h) in fixed:
+                    a, b = (i0, k) if i0 < k else (k, i0)
+                    t1, t2 = (jp, h) if i0 < k else (h, jp)
+                    conflict, _, _ = self.pair_info(a, t1, b, t2)
+                    if conflict:
+                        blocker = self._clearance_record(i0, jp, k, h)
+                        break
+                if blocker is None:
+                    break  # a valid takeover exists -> scenario is certified
+                blocked.append({
+                    "target_id": self.targets[jp].id,
+                    "extension_sq": self.len2[i0][jp],
+                    "blocked_by": blocker,
+                })
+            else:
+                if not reachable_unused:
+                    reason = ("no substitute target: every target is already "
+                              "used by the main plan or unreachable from "
+                              f"arm {self.arms[i0].id}")
+                else:
+                    reason = (
+                        f"arm {self.arms[i0].id} losing target "
+                        f"{self.targets[j0].id} has no reachable unused "
+                        "target clear of all fixed pairs"
+                    )
+                return {
+                    "arm_id": self.arms[i0].id,
+                    "lost_target_id": self.targets[j0].id,
+                    "reason": reason,
+                    "blocked_candidates": blocked,
+                }
+        raise ValueError("assignment is certifiable; no blocking scenario")
+
+    # ------------------------------------------------------------------
     # Result assembly with evidence
     # ------------------------------------------------------------------
+    def _clearance_record(self, i: int, j: int, k: int, h: int) -> dict:
+        """Pairwise clearance evidence for allocations (i->j),(k->h)."""
+        a, b = (i, k) if i < k else (k, i)
+        t1, t2 = (j, h) if i < k else (h, j)
+        conflict, dist_sq, w = self.pair_info(a, t1, b, t2)
+        dist = dist_sq ** Fraction(1, 2)
+        return {
+            "arm_a": self.arms[a].id,
+            "target_a": self.targets[t1].id,
+            "arm_b": self.arms[b].id,
+            "target_b": self.targets[t2].id,
+            "distance": float(dist),
+            "distance_exact": _sqrt_str(dist_sq),
+            "distance_squared_exact": _frac_str(dist_sq),
+            "required_clearance": self.clearance,
+            "satisfied": not conflict,
+            "witness": w,
+        }
+
     def build_result(self, assignment: Sequence[int], feasible: bool,
                      witness: Optional[dict]) -> SolveResult:
         pairs: List[dict] = []
@@ -402,20 +767,8 @@ class Solver:
                 k, h = placed[jdx]
                 a, b = (i, k) if i < k else (k, i)
                 t1, t2 = (j, h) if i < k else (h, j)
-                conflict, dist_sq, w = self.pair_info(a, t1, b, t2)
-                dist = dist_sq ** Fraction(1, 2)
-                record = {
-                    "arm_a": self.arms[a].id,
-                    "target_a": self.targets[t1].id,
-                    "arm_b": self.arms[b].id,
-                    "target_b": self.targets[t2].id,
-                    "distance": float(dist),
-                    "distance_exact": _sqrt_str(dist_sq),
-                    "distance_squared_exact": _frac_str(dist_sq),
-                    "required_clearance": self.clearance,
-                    "satisfied": not conflict,
-                    "witness": w,
-                }
+                _, dist_sq, _ = self.pair_info(a, t1, b, t2)
+                record = self._clearance_record(i, j, k, h)
                 pair_clearances.append(record)
                 if min_d2 is None or dist_sq < min_d2:
                     min_d2 = dist_sq

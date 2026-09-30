@@ -56,6 +56,43 @@ def random_instance(rng, n_arms=None, n_targets=None):
     return arms, targets, clearance
 
 
+def brute_certified(s, n_arms, n_targets, targets):
+    best = None
+    for combo in itertools.product(range(-1, n_targets), repeat=n_arms):
+        used = set()
+        placed = []
+        ok = True
+        ext = 0
+        prio = 0
+        for i, j in enumerate(combo):
+            if j < 0:
+                continue
+            if j in used or s.len2[i][j] is None:
+                ok = False
+                break
+            for k, h in placed:
+                a, b = (i, k) if i < k else (k, i)
+                t1, t2 = (j, h) if i < k else (h, j)
+                if s.pair_info(a, t1, b, t2)[0]:
+                    ok = False
+                    break
+            if not ok:
+                break
+            used.add(j)
+            placed.append((i, j))
+            ext += s.len2[i][j]
+            prio += targets[j].priority
+        if not ok:
+            continue
+        if not all(s.replacement_targets(placed, e) for e in placed):
+            continue
+        key = (len(placed), prio, -ext,
+               tuple(-x for x in stability_tuple(combo, n_targets)))
+        if best is None or key > best[0]:
+            best = (key, combo)
+    return best[1] if best else [-1] * n_arms
+
+
 def main():
     rng = random.Random(42)
     fails = 0
@@ -76,6 +113,21 @@ def main():
                 print(" arms:", arms)
                 print(" targets:", targets, "clearance", clearance)
     print(f"fuzz: 300 trials, fails={fails}, slow={slow}")
+
+    cert_fails = 0
+    for trial in range(150):
+        arms, targets, clearance = random_instance(rng)
+        s = Solver(arms, targets, clearance, 1)
+        a = s.solve_certified()
+        b = brute_certified(s, len(arms), len(targets), targets)
+        if tuple(a) != tuple(b):
+            cert_fails += 1
+            print("CERT MISMATCH", trial, "got", a, "want", b)
+            if cert_fails <= 3:
+                print(" arms:", arms)
+                print(" targets:", targets, "clearance", clearance)
+    print(f"cert fuzz: 150 trials, fails={cert_fails}")
+    fails += cert_fails
 
     random.seed(1)
     arms = [Arm(f"a{i}", random.randint(0, 40), random.randint(0, 40),

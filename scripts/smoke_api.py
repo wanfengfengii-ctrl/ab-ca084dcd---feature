@@ -8,7 +8,11 @@ It waits for readiness and exercises:
 2. an instance where pairwise collisions make the requested minimum
    impossible: the API must return the maximum achievable count and a clear
    reason (HTTP 200, status minimum_not_met);
-3. an illegal payload that must be rejected with HTTP 422 without solving.
+3. an illegal payload that must be rejected with HTTP 422 without solving;
+4. single-target-loss takeover: a certified request returning per-target
+   substitutions with fixed pairs and clearance evidence, plus an
+   uncertifiable request reporting the maximum certifiable size and its
+   first blocking loss scenario.
 
 Exits 0 on success, 1 on any failure.
 """
@@ -134,6 +138,52 @@ def main():
     bad["arms"] = bad["arms"][:5]
     request("POST", "/api/v1/adjudicate", bad, expect=(422,))
     print("illegal input rejected with 422")
+
+    # 4) single-target-loss takeover certification
+    payload = feasible_payload()
+    payload["targets"] += [
+        {"id": f"U{i}", "x": i * 100 + 10, "y": -10, "priority": 1}
+        for i in range(6)
+    ]
+    payload["single_target_loss_takeover"] = True
+    _, body = request("POST", "/api/v1/adjudicate", payload)
+    assert body["status"] == "ok" and body["feasible"] is True, body
+    rep = body["takeover"]
+    assert rep["certified"] is True and rep["max_certifiable_allocations"] == 6
+    assert rep["first_blocking_scenario"] is None
+    assert len(rep["scenarios"]) == 6
+    main_pairs = {p["arm_id"]: p["target_id"]
+                  for p in body["assignments"]}
+    for sc in rep["scenarios"]:
+        arm, lost = sc["arm_id"], sc["lost_target_id"]
+        assert main_pairs[arm] == lost
+        fixed = {p["arm_id"]: p["target_id"] for p in sc["fixed_pairs"]}
+        expected = dict(main_pairs)
+        del expected[arm]
+        assert fixed == expected
+        assert sc["replacement"]["target_id"] not in main_pairs.values()
+        assert len(sc["pair_evidence"]) == len(sc["fixed_pairs"])
+        for ev in sc["pair_evidence"]:
+            assert ev["satisfied"] is True
+            assert ev["distance"] + EPS >= ev["required_clearance"]
+    print("takeover certified OK: 6 scenarios with substitutions + evidence")
+
+    # uncertifiable: 6 arms/6 targets leaves no spare at all
+    bad_plan = feasible_payload()
+    bad_plan["arms"] = [{"id": f"A{i}", "x": i * 100, "y": 0,
+                         "max_extension": 50} for i in range(6)]
+    bad_plan["single_target_loss_takeover"] = True
+    _, body = request("POST", "/api/v1/adjudicate", bad_plan)
+    assert body["status"] == "takeover_not_certified", body
+    assert body["feasible"] is False
+    assert body["objective"]["num_allocations"] == 6
+    rep = body["takeover"]
+    assert rep["certified"] is False
+    assert rep["max_certifiable_allocations"] == 0
+    blk = rep["first_blocking_scenario"]
+    assert blk["arm_id"] == "A0" and blk["lost_target_id"] == "T0"
+    assert blk["blocked_candidates"] == []
+    print("takeover uncertifiable OK: max=0 with first blocking scenario")
 
     print("SMOKE: PASS")
     return 0

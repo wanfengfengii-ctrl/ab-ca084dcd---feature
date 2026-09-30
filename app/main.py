@@ -63,11 +63,74 @@ def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
     solver = Solver(arms, targets,
                     clearance=req.clearance,
                     minimum_allocations=req.minimum_allocations)
-    assignment, feasible, witness = solver.solve()
+
+    takeover_report = None
+    blocker = None
+    if req.single_target_loss_takeover:
+        # The certified plan is selected synchronously: the takeover
+        # guarantee is part of the main-plan optimisation, not a repair
+        # applied after obtaining the ordinary optimum.
+        cert_assignment = solver.solve_certified()
+        cert_count = sum(1 for x in cert_assignment if x >= 0)
+        certified = cert_count >= req.minimum_allocations
+        if certified:
+            assignment = cert_assignment
+            feasible = True
+            witness = None
+            scenarios = solver.takeover_scenarios(cert_assignment)
+        else:
+            # Explain the gap: report the ordinary optimum (and, when it
+            # reaches the requested size, the first loss scenario without
+            # a valid takeover, in arm submission order).
+            plain_assignment, plain_feasible, plain_witness = \
+                solver.last_plain_solution()
+            plain_count = sum(1 for x in plain_assignment if x >= 0)
+            assignment = plain_assignment
+            feasible = False
+            scenarios = []
+            witness = plain_witness if plain_count < req.minimum_allocations \
+                else None
+            plain_placed = [(i, j) for i, j in enumerate(plain_assignment)
+                            if j >= 0]
+            if plain_placed and not all(
+                    solver.replacement_targets(
+                        sorted(plain_placed), e) for e in plain_placed):
+                blocker = solver.first_blocking_scenario(plain_assignment)
+        takeover_report = {
+            "enabled": True,
+            "certified": certified,
+            "max_certifiable_allocations": cert_count,
+            "requested_minimum_allocations": req.minimum_allocations,
+            "scenarios": scenarios,
+            "first_blocking_scenario": blocker,
+        }
+    else:
+        assignment, feasible, witness = solver.solve()
+
     r = solver.build_result(assignment, feasible, witness)
+    if takeover_report is not None and not feasible and witness is None:
+        if blocker is not None:
+            r.reason = (
+                f"minimum_allocations={req.minimum_allocations} cannot be "
+                "certified for single-target-loss takeover: the maximum "
+                f"certifiable main plan has {cert_count} pair(s); first "
+                "blocking loss scenario: "
+                f"arm {blocker['arm_id']} losing {blocker['lost_target_id']}"
+                f" - {blocker['reason']}"
+            )
+        else:
+            r.reason = (
+                f"minimum_allocations={req.minimum_allocations} not met: "
+                f"the maximum certifiable main plan has {cert_count} pair(s)"
+            )
+
+    status = "ok" if feasible else (
+        "takeover_not_certified"
+        if takeover_report is not None and witness is None
+        else "minimum_not_met")
 
     return AdjudicateResponse(
-        status="ok" if feasible else "minimum_not_met",
+        status=status,
         feasible=feasible,
         reason=r.reason,
         objective={
@@ -99,6 +162,7 @@ def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
             "targets_submitted": len(targets),
         },
         witness=r.witness,
+        takeover=takeover_report,
     )
 
 
@@ -117,6 +181,13 @@ def _startup_self_check() -> None:
     s = Solver(arms, targets, clearance=1, minimum_allocations=6)
     a, ok, _ = s.solve()
     assert ok and sum(1 for x in a if x >= 0) == 6
+    # The single-target-loss takeover machinery must also certify a small
+    # plan with one spare and fail to certify an instance without spares.
+    cert_targets = targets + [Target("U0", 10, -10, 1)]
+    sc = Solver(arms, cert_targets, clearance=1, minimum_allocations=6)
+    ca = sc.solve_certified()
+    assert sum(1 for x in ca if x >= 0) == 6
+    assert len(sc.takeover_scenarios(ca)) == 6
     _ready = True
 
 
